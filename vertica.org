@@ -1,0 +1,226 @@
+* note
+*vertica is keepting improving. This doc is for version of 7.2, on higher version, some statements might not hold true*
+ 
+_please distinguish between fact and logic reasoning_
+* vertica: column base database
+** no in place data change
+In row base database, the data are organized into file blocks, if delete/update data, then it will modify that block. If insert data, it will create a new block if other blocks are full, or modify an existing block with sufficient free space. But in vertica, DML won't modify file in place, it will always create new files for delete/insert/update/merge.
+** delete vector
+If we delete some data, it will create a delete vector which stores something like which row in the container (ROS or WOS) is delete, and at which point of time it was delete. When we query the data, it will get the data from the table, and then compare with the delete vector to check whether a row should be return to end user or not. It's possible to query the data at an old snapshot, in order to return some deleted data (if these deleted data are not purged yet)
+** container
+*** WOS
+write optimized storage, it's data stored in memory. The data format is still in row based data, so easier to modify. WOS has a dedicate resoure pool, if too many data inserted, then we could get out of memory error.
+*** ROS
+read optimized storage, it's data is store in disk. The data is in column based data after compression, since it's compressed, so the size is much smaller than the one in WOS. ROS could be created either by use /*+ direct */ hint in the DML, or created by background job to move out data from WOS from ROS.
+ROS contains one file for each column in the projection.
++ Normally one partition should have one ROS
++ When one partition have many ROS:
+   if we insert data into the data projection multiple time using direct hint, then each direct will create one ROS.
++ When one ROS have many projection:
+   if we merge_partition function, then it will consolidate the impacted partitions into one ROS.
+ 
+** no indexes
+There is no index storing information about each row as in row based database, but there are some index like file which store the max, min, count of the data in a ROS. So if a table have 10 partitions, and 10 ROS, all data has period_key >2dddd
+ 
+#+BEGIN_EXAMPLE
+[dbadmin@ENGP2VTCN7 997]$ cd 0255b541e80136ccdd9bc7d719bbde9e00b000000455fa75/
+[dbadmin@ENGP2VTCN7 0255b541e80136ccdd9bc7d719bbde9e00b000000455fa75]$ ls -l
+total 8
+-rw------- 1 dbadmin verticadba 294 Dec 30  2015 0255b541e80136ccdd9bc7d719bbde9e00b000000455fa75_0.fdb
+-rw------- 1 dbadmin verticadba  56 Dec 30  2015 0255b541e80136ccdd9bc7d719bbde9e00b000000455fa75_0.pidx
+#+END_EXAMPLE
+** important tables 
+*if you have time, play with these tables will help you get deeper understanding of how vertica works*
+*** system tables
+#+BEGIN_SRC sql
+select * from system_tables;
+#+END_SRC
+ 
+*** data collector
+#+BEGIN_SRC sql
+select * from data_collector;
+#+END_SRC
+ 
+* waiting in vertica
+** caused by lock confliction
+check the table of locks to see whether the are locks issue
+** caused by resource pool limitation
+When we issue a query to vertica, it will use the resource from a resource pool, and each resource pool has a setting of maxconcurrency which will cap the running query simutaneiously on that pool.. The following is the query used to get how many concurrent query are allowed to run for each resource pool.
+#+BEGIN_SRC sql
+select name, maxconcurrency from resource_pools
+#+END_SRC
+If there are more queries to run than the maxconcurrency, then some need to wait until there are free slot to run. We could check how many query are running for a resour pool using the following query.
+#+BEGIN_SRC sql
+select pool_name,running_query_count,max_concurrency from resource_pool_status
+   where max_concurrency >0
+order by max_concurrency-running_query_count asc;
+#+END_SRC
+If the running_query_count equals to max_concurrency, then there could be some queries queued. The queued queries could be got from the following sql:
+#+BEGIN_SRC sql
+select * from resource_queues;
+#+END_SRC
+** caused by lack of free memory
+Every resource pool has a max size of memory to use. If these memory is used up, then other queries need to queue until some memory is freed up.
+*** lack of memory when a query begin to start
+When a query begin to run, vertica needs to assign an initial memory to it. Thse initial memory size is calculated sa memory_for_the_pool/plan_concurrent_for_the_pool. The related query is as below
+#+BEGIN_SRC sql
+select name, maxmemorysize, plannedconcurrency from resource_pools
+#+END_SRC
+*** lack of memory when a query is running but waiting for more resource
+If vertica found the initial memory allocated is not enought to do sort/hash, then it will trying to acquire additional memory, if there is not enough free memory in the resource pool to allocate these additional memory, then this query need to wait until memory is freed up.
+* some use query
+ 
+** Get locks
+#+BEGIN_SRC sql
+select * from locks;
+#+END_SRC
+ 
+** How long did a transaction wait for locks
+#+BEGIN_SRC sql
+ 
+select time, transaction_id, node_name, time - start_time as queued_time, object_name,mode from dc_lock_attempts
+--where transaction_id =54043195579099644
+limit 10
+#+END_SRC
+| time                |    transaction_id | node_name         |     queued_time | object_name                                                | mode |
+| 2016-09-28 03:14:19 | 49539595952303223 | v_fusion_node0001 | 00:00:00.400000 | Table:LOREAL_SDRUG_Kalyan.ANL_FACT_BASELINE_1              | T    |
+| 2016-09-28 03:14:19 | 49539595952303223 | v_fusion_node0001 | 00:00:00.300000 | Table:LOREAL_SDRUG_Kalyan..ANL_FACT_BASELINE_2              | T    |
+| 2016-09-28 03:14:19 | 49539595952303223 | v_fusion_node0001 | 00:00:00.300000 | Table:LOREAL_SDRUG_Kalyan.ANL_FACT_FORECASTING_1           | T    |
+| 2016-09-28 03:14:19 | 49539595952303223 | v_fusion_node0001 | 00:00:00.300000 | Table:LOREAL_SDRUG_Kalyan.ANL_FACT_FORECASTING_1_EXCEPTION | T    |
+| 2016-09-28 03:14:19 | 49539595952303223 | v_fusion_node0001 | 00:00:00.400000 | Table:LOREAL_SDRUG_Kalyan.ANL_FACT_FORECASTING_2           | T    |
+** How long is a transaction held a lock (from the time grant the lock to release the lock)
+#+BEGIN_SRC sql
+select time, transaction_id, node_name, time - grant_time as during, object_name,mode from dc_lock_releases
+--where transaction_id =54043195579099644
+limit 1
+#+END_SRC
+ 
+| time                |    transaction_id | node_name         |          during | object_name                                           | mode |
+| 2016-09-27 09:55:07 | 45035996423149261 | v_fusion_node0001 | 00:00:00.180000 | Table:EDM_PEPSI_KROGER.RSI_TRANSFER_EVENT_DIM_MAPPING | U    |
+| 2016-09-27 09:55:07 | 45035996423149262 | v_fusion_node0001 | 00:00:00.181000 | Table:EDM_PEPSI_KROGER.RSI_TRANSFER_EVENT_DIM_MAPPING | U    |
+| 2016-09-27 09:55:07 | 45035996423149263 | v_fusion_node0001 | 00:00:00.200000 | Table:EDM_PEPSI_KROGER.ATTRIBUTE_DICTIONARY           | U    |
+| 2016-09-27 09:55:07 | 45035996423149264 | v_fusion_node0001 | 00:00:00.158000 | Table:EDM_PEPSI_KROGER.ATTRIBUTE_DICTIONARY           | U    |
+| 2016-09-27 09:55:07 | 45035996423149265 | v_fusion_node0001 | 00:00:00.200000 | Table:EDM_PEPSI_KROGER.ATTRIBUTE_DICTIONARY_TEMP      | U    |
+ 
+** Get information on requests pending for various resource pools.
+Ideally this should return 0 rows.
+ 
+#+BEGIN_SRC sql
+select * from resource_queues
+#+END_SRC
+** Get current session information
+#+BEGIN_SRC sql
+select * from current_session;
+#+END_SRC
+** Get running query
+#+BEGIN_SRC sql
+select * from sessions where current_statement <>'';
+ 
+select query_duration_us, query_start, * from query_profiles
+where not is_executing order by query_start;
+ 
+#+END_SRC
+** Get all the sql statements from an application
+ 
+If an application issues many requests to vertica in a single session, then we could first get the session id by query table of sessions, either by filter by username, client_host or login_timestamp. Then using that sessoion_id to filter query_profiles we could get all the queries from that application.
+#+BEGIN_SRC sql
+select query_duration_us, query_start, * from query_profiles where session_id= 'my_session_id'
+#+END_SRC
+** Get the execution details of a query
+The execution of a sql contains many steps, the table of query_plan_profiles store the information of each step for a query. It's very helpful to debug the performance. And this table stores the real time information, so we could check the progress of a query during the execution. Say if a query have 10 step in the execution plan, and now it's on step 8, by comparing with the execution plan, we could know how much work is done and how much is left to do.
+ 
+The running_time of the column stores how much time elapse from the beginning of the query execution to end of  the current step. By checking this column, it will give us some idea which step is the most expensive on.
+#+BEGIN_SRC sql
+select * from query_plan_profiles
+--where transaction_id = 54043195579194564
+limit 10
+#+END_SRC
+ 
+* explain plan
+** explain
+This is to show an execution plan in a less verbose format, it only shows basic information
+** explain local verbose 
+This is the prefered one to get more details of a plan
+ 
++ does the table has correct statistics?
+ 
+  If there is no statistics or out of date statistics then we need to gather statistics. With wrong statistics, it's prone to have a wrong execution plan. But HP said statistics out of range is not harmful for vertica, while I found it's harmful for sql server or oracle. Looks like vertica use existing statistics to extrapolate the statistics for out range value.
+ 
+  e.g if in the statistics, it says on period_key from 20150101 to 20160801, there are around 1M rows for each period_key. When we query the table with filter period_key = 20160901, if on sql server, it THINKS it will return 1 row (1 row is safter than 0 row since if 0 rows, then join any table will return 0 rows), and use 1 row as a base to create the plan. But on vertica, in the plan it shows a warning that statistics out of range, but it used extrapolated statistics to create the plan. For our production, every period_key has similar row count. So it doesn't harm when I don't gather new statistics on fact table if we already have stable old statistics.
++ What's the row size? Is it reasonable?
+ 
+  In PATH ID:2, the row size is 520, why in PATH ID:1, it increased to 5660?
+ 
+   If looking at the plan carefully, we could find the GROUP BY is on collation(olap_item.UPC, 'LEN_S2') instead of directly on column of UPC, that's because the database is case insensitive, so vertica converts the UPC to another collation before group by, and after that convertion, the lengh of the string increased a lot. So when group by a varchar column on a case insensitive database, it will be more costly than on database with case sensitive setting, as it not only need to convert each value, but also need much more memory to process.
+ 
+   UPC is a type of varchar(512), why it needs to have 520 bytes for each row? As normally UPC is less than 20 bytes. The reason is that vertica allocates a memory whose size is definition of the column, in which case it's 512. So from this example, we could see if we group by a varchar column, it's better to have the right column definition, otherwise we need a large memory to process the query.
+ 
+   if the size of the column varies a lot, and majority of the data are very short, and the rest are very long, one possible approach is to create 2 tables, one store the data with short size, and another to store long data. And then processing each table and combine the result. This is complex and need to consider whether it's worthwhile. if we don't encouter memory pressure error, then don't need such approach. If can't resolve the memory issue, this is a possible approch.
++ how many rows return in each step? Is it reasonable?
+ 
+  Is the row count estimated in the plan reasonable? If the estimation is far away from the fact, might need to re-gather statistics.
+ 
++ Home much memory is required?
+ 
+ 
+ 
+ 
+#+BEGIN_EXAMPLE
+------------------------------
+QUERY PLAN DESCRIPTION:
+------------------------------
+ 
+Opt Vertica Options
+--------------------
+PLAN_OUTPUT_SUPER_VERBOSE
+ 
+ 
+explain local verbose select upc,count(*) from TEST.olap_item group by upc
+ 
+Access Path:
+Sort Key: (V(102,-3))
+LDISTRIB_SEGMENTED
++-GROUPBY HASH (LOCAL RESEGMENT GROUPS) [Cost: 76605.000000, Rows: 112904.000000 Disk(B): 640843104.000000 CPU(B): 58710080.000000 Memory(B): 1279879744.000000 Netwrk(B): 0.000000 Parallelism: 3.000000] [OutRowSz (B): 5660] (PATH ID: 1)
+|  Aggregates: max(olap_item.UPC), count(*)
+|  Group By: collation(olap_item.UPC, 'LEN_S2')
+|  Execute on: Query Initiator
+|  Sort Key: (V(102,-3))
+|  LDISTRIB_SEGMENTED
+| +---> STORAGE ACCESS for olap_item [Cost: 3143.000000, Rows: 112904.000000 Disk(B): 0.000000 CPU(B): 0.000000 Memory(B): 0.000000 Netwrk(B): 0.000000 Parallelism: 1.000000] [OutRowSz (B): 520] (PATH ID: 2)
+| |      Column Cost Aspects: [ Disk(B): 1310720.000000 CPU(B): 0.000000 Memory(B): 57806848.000000 Netwrk(B): 0.000000 Parallelism: 1.000000 ]
+| |      Projection: TEST.OLAP_ITEM_node0001
+| |      Materialize: olap_item.UPC
+| |      Execute on: Query Initiator
+| |      Sort Key: (OLAP_ITEM.ITEM_KEY)
+| |      LDISTRIB_SEGMENTED
+ 
+#+END_EXAMPLE
+ 
+ 
+* Some reasoning
+*it's not fully fact, there are logic reasoning*
+Since veritca is a column based database, will it be fast to add a new column. Say if we have a table with 100 columns, and one of the column needs to be updated every day. Is it possible to drop that column, and then create a new column with the right data and append that column back to the table?
+ 
+Looks like this is an promising. But think how vertica store data: data are created/inserted/updated at certain point of time, and that time is important for vertica to function correctly. Think about delete vector. When we delete some data, it doens't change the existing data, but intead add a file storing when and which row are deleted. When we query data at a point of time in the past, say before we delete the data, then vertica should return all data, including the delete data. How doesn't this work? Vertica store each row a time point, in the face of epoche. So each table has a hidden column of epoche storing when the data were created. Then vertica could compare that epoche value with the one in delete velete to know whether vertica should return the data.
+ 
+say we have the following data in a table
+ 
+| epoche | row_seq | some_col |
+|      1 |       1 | a        |
+|      2 |       2 | b        |
+|      3 |       3 | a        |
+|      4 |       4 | b        |
+|      5 |       5 | a        |
+|      6 |       6 | b        |
+                  
+                  
+and the following in the delete vector             
+| epoche | row_seq |
+|      5 |       4 |
+|      3 |       5 |
+ 
+So when vertica comes to row 4,5, it will compare the epoche of the table and the vector, for row 4, the epoche in the table is 4 while delete vector has the value as 5, so delete happened later than insert, that means we need to reject that row. For similar reason we need to keep row of 5 since it is first delete but later inserted.
+ 
+ 
+So now we see vertica stores epoche with each row. All the columns in the same row are bound to the same epoche. if we drop an column, that's easy, just remove the file bidding to the column. But if add a new column, it's added on an epoche which is newer than the other columns in the same row (if we append the column forcely), so for the same row, we have some columns with one epoche, and some columns with different epoche. We might think just update the old epoche with the new one in the new column, but vertica doesn't do any update physically, it only do insert. So it's hard to have the abilitiy to append a column to an exsiting table.
+Confidentiality Disclosure: The information contained in this electronic mail transmission is confidential and is intended only for the stated entity or individual recipient of the transmission. If you are not the intended recipient, any review, disclosure, copying, distribution, or reliance upon the content of this communication is strictly prohibited. If you have received this electronic mail transmission in error, please reply to the sender via a separate email that does not include the original and delete any and all copies of this email.
